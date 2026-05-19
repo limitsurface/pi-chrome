@@ -764,8 +764,6 @@ async function dispatch(action, params) {
       return takeScreenshot(params);
     case "page.generate_image":
       return chromeImageGenerate(params);
-    case "page.edit_image":
-      return chromeImageEdit(params);
     case "page.init_project":
       return chromeImageInit(params);
     default:
@@ -2105,6 +2103,7 @@ async function findOrCreateChatGPTTab(foreground) {
     tab = await chrome.tabs.create({ url: "https://chatgpt.com", active: true });
     // Wait for load
     await waitForTabComplete(tab.id, 15000);
+    await sleep(3000);
   } else {
     if (foreground) {
       await bringToFront(tab);
@@ -2288,10 +2287,11 @@ async function setChatGPTModelMode(tabId, thinking) {
 async function chromeImageGenerate(params) {
   const prompt = params.prompt;
   const aspectRatio = params.aspectRatio;
+  const referencePaths = params.referencePaths || [];
   const foreground = params.foreground !== false;
   
   let fullPrompt = prompt;
-  if (aspectRatio) {
+  if (aspectRatio && referencePaths.length === 0) {
     fullPrompt += `, image aspect ratio: ${aspectRatio}`;
   }
 
@@ -2299,30 +2299,98 @@ async function chromeImageGenerate(params) {
   const tab = await findOrCreateChatGPTTab(foreground);
   await attachDebugger(tab.id);
 
-  // 2. Switch ChatGPT model mode if requested
+  // 2. Navigate to the bound project URL (or chatgpt.com) to start a new thread inside the project
+  const targetUrl = params.projectUrl || "https://chatgpt.com";
+  await chrome.tabs.update(tab.id, { url: targetUrl });
+  await waitForTabComplete(tab.id, 20000);
+  await sleep(3000);
+
+  // 3. Switch ChatGPT model mode if requested
   if (params.thinking !== undefined) {
     await setChatGPTModelMode(tab.id, params.thinking);
   }
 
-  // 3. Count existing generated images before dispatch
-  const initialCount = await countImages(tab.id);
+  const uploadedFilenames = referencePaths.map(p => p.split(/[/\\]/).pop());
 
-  // 4. Enter prompt and send
-  await chromeInputFill({
-    targetId: tab.id,
-    selector: "#prompt-textarea",
-    text: fullPrompt,
-    submit: true,
-    foreground
+  // 4. Count existing generated images before dispatch
+  const initialCount = await countImages(tab.id, uploadedFilenames);
+
+  // 5. Upload reference images if any
+  if (referencePaths.length > 0) {
+    await chromeInputUpload({
+      targetId: tab.id,
+      selector: 'input[type="file"]',
+      paths: referencePaths,
+      foreground
+    });
+    // Settle delay for file uploads to complete in ChatGPT UI
+    await sleep(4000);
+  }
+
+  // 6. Enter prompt using direct React-compatible paste
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    func: (promptText) => {
+      const el = document.querySelector("#prompt-textarea");
+      if (!el) throw new Error("Could not find prompt text area");
+      el.focus();
+      
+      const prototype = HTMLTextAreaElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(el, promptText);
+      } else {
+        el.value = promptText;
+      }
+      
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "a", code: "KeyA" }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "a", code: "KeyA" }));
+      return true;
+    },
+    args: [fullPrompt]
   });
 
-  // 5. Poll for the new image (wait up to 90 seconds)
+  await sleep(1000);
+
+  // Trigger form submit
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    func: () => {
+      const el = document.querySelector("#prompt-textarea");
+      if (!el) return false;
+      
+      let sendBtn = document.querySelector('button[data-testid="send-button"], button[aria-label="Send prompt"]');
+      if (!sendBtn) {
+        const btns = Array.from(document.querySelectorAll("button"));
+        sendBtn = btns.find(b => {
+          const label = (b.getAttribute("aria-label") || b.innerText || "").toLowerCase();
+          return label.includes("send prompt") || label.includes("submit") || b.querySelector('svg');
+        });
+      }
+      
+      if (sendBtn) {
+        sendBtn.click();
+        return true;
+      }
+      
+      const enterEv = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13 });
+      el.dispatchEvent(enterEv);
+      return true;
+    }
+  });
+
+  // 7. Poll for the new image (wait up to 120 seconds if references are used, otherwise 90s)
+  const maxWait = referencePaths.length > 0 ? 120000 : 90000;
   const started = Date.now();
   let imageUrl = null;
-  while (Date.now() - started < 90000) {
-    const currentCount = await countImages(tab.id);
+  while (Date.now() - started < maxWait) {
+    const currentCount = await countImages(tab.id, uploadedFilenames);
     if (currentCount > initialCount) {
-      imageUrl = await getLastImageUrl(tab.id);
+      imageUrl = await getLastImageUrl(tab.id, uploadedFilenames);
       if (imageUrl && !imageUrl.startsWith("blob:")) {
         break;
       }
@@ -2334,74 +2402,14 @@ async function chromeImageGenerate(params) {
     throw new Error("Timed out waiting for DALL-E image generation to complete.");
   }
 
-  // 6. Download the image
-  const dataUrl = await downloadImageAsDataUrl(imageUrl);
-  return { dataUrl };
-}
-
-async function chromeImageEdit(params) {
-  const prompt = params.prompt;
-  const referencePath = params.referencePath;
-  const foreground = params.foreground !== false;
-  const filename = referencePath.split(/[/\\]/).pop();
-
-  // 1. Locate/activate ChatGPT tab
-  const tab = await findOrCreateChatGPTTab(foreground);
-  await attachDebugger(tab.id);
-
-  // 2. Switch ChatGPT model mode if requested
-  if (params.thinking !== undefined) {
-    await setChatGPTModelMode(tab.id, params.thinking);
-  }
-
-  // 3. Count existing generated images before dispatch
-  const initialCount = await countImages(tab.id, [filename]);
-
-  // 4. Upload reference image
-  await chromeInputUpload({
-    targetId: tab.id,
-    selector: 'input[type="file"]',
-    paths: [referencePath],
-    foreground
-  });
-
-  // Wait for upload UI integration
-  await sleep(3000);
-
-  // 5. Enter prompt and send
-  await chromeInputFill({
-    targetId: tab.id,
-    selector: "#prompt-textarea",
-    text: prompt,
-    submit: true,
-    foreground
-  });
-
-  // 6. Poll for the new image (wait up to 120 seconds)
-  const started = Date.now();
-  let imageUrl = null;
-  while (Date.now() - started < 120000) {
-    const currentCount = await countImages(tab.id, [filename]);
-    if (currentCount > initialCount) {
-      imageUrl = await getLastImageUrl(tab.id, [filename]);
-      if (imageUrl && !imageUrl.startsWith("blob:")) {
-        break;
-      }
-    }
-    await sleep(2000);
-  }
-
-  if (!imageUrl) {
-    throw new Error("Timed out waiting for DALL-E image edit to complete.");
-  }
-
-  // 7. Download the image
+  // 8. Download the image
   const dataUrl = await downloadImageAsDataUrl(imageUrl);
   return { dataUrl };
 }
 
 async function chromeImageInit(params) {
   const foreground = params.foreground !== false;
+  const projectName = params.projectName || "gpt-image-cli";
   
   // 1. Locate/activate ChatGPT tab
   const tab = await findOrCreateChatGPTTab(foreground);
@@ -2413,7 +2421,6 @@ async function chromeImageInit(params) {
   await sleep(3000);
   
   // 2. Click 'New project' button
-  // Wait up to 20 seconds for the button to appear
   const started = Date.now();
   let newProjClicked = false;
   while (Date.now() - started < 20000) {
@@ -2443,17 +2450,17 @@ async function chromeImageInit(params) {
   
   await sleep(2000);
   
-  // 3. Set project name to 'gpt-image-cli' in the name input field and click 'Create project'
+  // 3. Set project name in the name input field and click 'Create project'
   let projectCreated = false;
   const createdStarted = Date.now();
   while (Date.now() - createdStarted < 15000) {
     const createdRes = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
       world: "MAIN",
-      func: () => {
+      func: (name) => {
         const input = document.querySelector('input[type="text"]');
         if (input) {
-          input.value = "gpt-image-cli";
+          input.value = name;
           input.dispatchEvent(new Event("input", { bubbles: true }));
           
           // Now click the create button
@@ -2465,7 +2472,8 @@ async function chromeImageInit(params) {
           }
         }
         return false;
-      }
+      },
+      args: [projectName]
     });
     if (createdRes?.[0]?.result) {
       projectCreated = true;
@@ -2484,7 +2492,7 @@ async function chromeImageInit(params) {
   while (Date.now() - redirectStarted < 20000) {
     const currentTab = await chrome.tabs.get(tab.id);
     const url = currentTab.url || "";
-    if (url.includes("gpt-image-cli")) {
+    if (url.includes(projectName)) {
       projectUrl = url;
       break;
     }
@@ -2493,16 +2501,17 @@ async function chromeImageInit(params) {
     const linksRes = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
       world: "MAIN",
-      func: () => {
+      func: (name) => {
         const links = Array.from(document.querySelectorAll("a"));
-        const link = links.find(l => (l.getAttribute("href") || "").includes("gpt-image-cli"));
+        const link = links.find(l => (l.getAttribute("href") || "").includes(name));
         if (link) {
           const href = link.getAttribute("href");
           if (href.startsWith("/")) return "https://chatgpt.com" + href;
           return href;
         }
         return null;
-      }
+      },
+      args: [projectName]
     });
     
     if (linksRes?.[0]?.result) {

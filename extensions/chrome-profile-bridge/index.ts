@@ -464,7 +464,6 @@ const CHROME_TOOL_NAMES = [
 	"chrome_scroll",
 	"chrome_upload_file",
 	"chrome_generate_image",
-	"chrome_edit_image",
 	"chrome_init_project",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
