@@ -762,6 +762,12 @@ async function dispatch(action, params) {
     }
     case "page.screenshot":
       return takeScreenshot(params);
+    case "page.generate_image":
+      return chromeImageGenerate(params);
+    case "page.edit_image":
+      return chromeImageEdit(params);
+    case "page.init_project":
+      return chromeImageInit(params);
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -2080,4 +2086,435 @@ function normalizeKey(key) {
     arrowright: "ArrowRight",
   };
   return table[String(key).toLowerCase()] || key;
+}
+
+// =========================================================================
+// =================== IMAGE GENERATION CUSTOM FORK CODE ===================
+// =========================================================================
+
+async function findOrCreateChatGPTTab(foreground) {
+  const tabs = await chrome.tabs.query({});
+  // 1. Look for an active/open project tab
+  let tab = tabs.find(t => (t.url || "").includes("chatgpt.com/g/"));
+  // 2. Fall back to any chatgpt.com tab
+  if (!tab) {
+    tab = tabs.find(t => (t.url || "").includes("chatgpt.com"));
+  }
+  // 3. Fall back to creating a new tab
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: "https://chatgpt.com", active: true });
+    // Wait for load
+    await waitForTabComplete(tab.id, 15000);
+  } else {
+    if (foreground) {
+      await bringToFront(tab);
+      await chrome.tabs.update(tab.id, { active: true });
+    }
+  }
+  return tab;
+}
+
+function countGeneratedImagesInTab(uploadedFilenames) {
+  const images = document.querySelectorAll("img");
+  let count = 0;
+  for (const img of images) {
+    const src = img.getAttribute("src") || "";
+    const alt = (img.getAttribute("alt") || "").toLowerCase();
+    
+    // Ignore all user-uploaded file previews
+    if (uploadedFilenames && uploadedFilenames.length) {
+      if (uploadedFilenames.some(name => alt.includes(name))) {
+        continue;
+      }
+    }
+    if ([".png", ".jpg", ".jpeg", ".webp", ".gif"].some(ext => alt.endsWith(ext))) {
+      continue;
+    }
+      
+    if (src.includes("/backend-api/estuary/content") || 
+        src.includes("oaiusercontent.com") || 
+        src.startsWith("blob:") || 
+        alt.startsWith("generated image:") ||
+        alt.includes("generated")) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function countImages(tabId, uploadedFilenames) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: countGeneratedImagesInTab,
+    args: [uploadedFilenames || []],
+  });
+  return results?.[0]?.result || 0;
+}
+
+function getLastGeneratedImageUrlInTab(uploadedFilenames) {
+  const images = Array.from(document.querySelectorAll("img"));
+  if (!images.length) return null;
+  
+  for (const img of images.reverse()) {
+    const src = img.getAttribute("src") || "";
+    if (!src) continue;
+    
+    const alt = (img.getAttribute("alt") || "").toLowerCase();
+    
+    // Ignore all user-uploaded file previews
+    if (uploadedFilenames && uploadedFilenames.length) {
+      if (uploadedFilenames.some(name => alt.includes(name))) {
+        continue;
+      }
+    }
+    if ([".png", ".jpg", ".jpeg", ".webp", ".gif"].some(ext => alt.endsWith(ext))) {
+      continue;
+    }
+      
+    if (src.includes("/backend-api/estuary/content") || 
+        src.includes("oaiusercontent.com") || 
+        src.startsWith("blob:") || 
+        alt.startsWith("generated image:") ||
+        alt.includes("generated")) {
+      return src;
+    }
+  }
+  return null;
+}
+
+async function getLastImageUrl(tabId, uploadedFilenames) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: getLastGeneratedImageUrlInTab,
+    args: [uploadedFilenames || []],
+  });
+  return results?.[0]?.result || null;
+}
+
+async function downloadImageAsDataUrl(imageUrl) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const response = await fetch(imageUrl);
+      if (!response.ok) throw new Error(`HTTP status ${response.status}`);
+      const arrayBuffer = await response.arrayBuffer();
+      const uint8Array = new Uint8Array(arrayBuffer);
+      let binaryString = "";
+      for (let i = 0; i < uint8Array.length; i++) {
+        binaryString += String.fromCharCode(uint8Array[i]);
+      }
+      const base64 = btoa(binaryString);
+      return `data:${response.headers.get("content-type") || "image/png"};base64,${base64}`;
+    } catch (err) {
+      lastError = err;
+      await sleep(2000);
+    }
+  }
+  throw new Error(`Failed to download generated image after 5 attempts: ${lastError?.message || lastError}`);
+}
+
+async function setChatGPTModelMode(tabId, thinking) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (thinking) => {
+      const targetMode = thinking ? "Thinking" : "Instant";
+      const selector = 'button[aria-haspopup="menu"]';
+      
+      const buttons = Array.from(document.querySelectorAll(selector));
+      let toggleBtn = null;
+      let currentMode = "";
+      
+      for (const btn of buttons) {
+        const text = (btn.innerText || "").trim();
+        if (text.toLowerCase().includes("instant") || text.toLowerCase().includes("thinking")) {
+          toggleBtn = btn;
+          currentMode = text;
+          break;
+        }
+      }
+      
+      if (!toggleBtn) {
+        const allBtns = Array.from(document.querySelectorAll("button"));
+        for (const btn of allBtns) {
+          const text = (btn.innerText || "").trim();
+          if (text.toLowerCase().includes("instant") || text.toLowerCase().includes("thinking")) {
+            toggleBtn = btn;
+            currentMode = text;
+            break;
+          }
+        }
+      }
+      
+      if (!toggleBtn) return "not_found";
+      if (currentMode.toLowerCase() === targetMode.toLowerCase()) return "already_set";
+      
+      toggleBtn.click();
+      return "clicked";
+    },
+    args: [thinking],
+  });
+  
+  const status = results?.[0]?.result;
+  if (status === "clicked") {
+    await sleep(2000);
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      world: "MAIN",
+      func: (thinking) => {
+        const targetMode = thinking ? "Thinking" : "Instant";
+        const optionSelector = `button:has-text("${targetMode}"), [role="menuitem"]:has-text("${targetMode}"), [role="option"]:has-text("${targetMode}")`;
+        
+        let optionEl = document.querySelector(optionSelector);
+        if (!optionEl) {
+          const items = Array.from(document.querySelectorAll('button, [role="menuitem"], [role="option"]'));
+          optionEl = items.find(item => (item.innerText || "").trim().toLowerCase() === targetMode.toLowerCase());
+        }
+        
+        if (optionEl) {
+          optionEl.click();
+          return true;
+        }
+        return false;
+      },
+      args: [thinking],
+    });
+    await sleep(1500);
+  }
+}
+
+async function chromeImageGenerate(params) {
+  const prompt = params.prompt;
+  const aspectRatio = params.aspectRatio;
+  const foreground = params.foreground !== false;
+  
+  let fullPrompt = prompt;
+  if (aspectRatio) {
+    fullPrompt += `, image aspect ratio: ${aspectRatio}`;
+  }
+
+  // 1. Locate/activate ChatGPT tab
+  const tab = await findOrCreateChatGPTTab(foreground);
+  await attachDebugger(tab.id);
+
+  // 2. Switch ChatGPT model mode if requested
+  if (params.thinking !== undefined) {
+    await setChatGPTModelMode(tab.id, params.thinking);
+  }
+
+  // 3. Count existing generated images before dispatch
+  const initialCount = await countImages(tab.id);
+
+  // 4. Enter prompt and send
+  await chromeInputFill({
+    targetId: tab.id,
+    selector: "#prompt-textarea",
+    text: fullPrompt,
+    submit: true,
+    foreground
+  });
+
+  // 5. Poll for the new image (wait up to 90 seconds)
+  const started = Date.now();
+  let imageUrl = null;
+  while (Date.now() - started < 90000) {
+    const currentCount = await countImages(tab.id);
+    if (currentCount > initialCount) {
+      imageUrl = await getLastImageUrl(tab.id);
+      if (imageUrl && !imageUrl.startsWith("blob:")) {
+        break;
+      }
+    }
+    await sleep(2000);
+  }
+
+  if (!imageUrl) {
+    throw new Error("Timed out waiting for DALL-E image generation to complete.");
+  }
+
+  // 6. Download the image
+  const dataUrl = await downloadImageAsDataUrl(imageUrl);
+  return { dataUrl };
+}
+
+async function chromeImageEdit(params) {
+  const prompt = params.prompt;
+  const referencePath = params.referencePath;
+  const foreground = params.foreground !== false;
+  const filename = referencePath.split(/[/\\]/).pop();
+
+  // 1. Locate/activate ChatGPT tab
+  const tab = await findOrCreateChatGPTTab(foreground);
+  await attachDebugger(tab.id);
+
+  // 2. Switch ChatGPT model mode if requested
+  if (params.thinking !== undefined) {
+    await setChatGPTModelMode(tab.id, params.thinking);
+  }
+
+  // 3. Count existing generated images before dispatch
+  const initialCount = await countImages(tab.id, [filename]);
+
+  // 4. Upload reference image
+  await chromeInputUpload({
+    targetId: tab.id,
+    selector: 'input[type="file"]',
+    paths: [referencePath],
+    foreground
+  });
+
+  // Wait for upload UI integration
+  await sleep(3000);
+
+  // 5. Enter prompt and send
+  await chromeInputFill({
+    targetId: tab.id,
+    selector: "#prompt-textarea",
+    text: prompt,
+    submit: true,
+    foreground
+  });
+
+  // 6. Poll for the new image (wait up to 120 seconds)
+  const started = Date.now();
+  let imageUrl = null;
+  while (Date.now() - started < 120000) {
+    const currentCount = await countImages(tab.id, [filename]);
+    if (currentCount > initialCount) {
+      imageUrl = await getLastImageUrl(tab.id, [filename]);
+      if (imageUrl && !imageUrl.startsWith("blob:")) {
+        break;
+      }
+    }
+    await sleep(2000);
+  }
+
+  if (!imageUrl) {
+    throw new Error("Timed out waiting for DALL-E image edit to complete.");
+  }
+
+  // 7. Download the image
+  const dataUrl = await downloadImageAsDataUrl(imageUrl);
+  return { dataUrl };
+}
+
+async function chromeImageInit(params) {
+  const foreground = params.foreground !== false;
+  
+  // 1. Locate/activate ChatGPT tab
+  const tab = await findOrCreateChatGPTTab(foreground);
+  await attachDebugger(tab.id);
+  
+  // Navigate to https://chatgpt.com to ensure we are on the main landing page with project sidebars
+  await chrome.tabs.update(tab.id, { url: "https://chatgpt.com" });
+  await waitForTabComplete(tab.id, 15000);
+  await sleep(3000);
+  
+  // 2. Click 'New project' button
+  // Wait up to 20 seconds for the button to appear
+  const started = Date.now();
+  let newProjClicked = false;
+  while (Date.now() - started < 20000) {
+    const clickedRes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: () => {
+        const btns = Array.from(document.querySelectorAll("button, a"));
+        const btn = btns.find(b => (b.innerText || "").includes("New project"));
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        return false;
+      }
+    });
+    if (clickedRes?.[0]?.result) {
+      newProjClicked = true;
+      break;
+    }
+    await sleep(2000);
+  }
+  
+  if (!newProjClicked) {
+    throw new Error("Could not find 'New project' button on the ChatGPT interface. Make sure you are logged in and have access to Projects.");
+  }
+  
+  await sleep(2000);
+  
+  // 3. Set project name to 'gpt-image-cli' in the name input field and click 'Create project'
+  let projectCreated = false;
+  const createdStarted = Date.now();
+  while (Date.now() - createdStarted < 15000) {
+    const createdRes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: () => {
+        const input = document.querySelector('input[type="text"]');
+        if (input) {
+          input.value = "gpt-image-cli";
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          
+          // Now click the create button
+          const btns = Array.from(document.querySelectorAll("button"));
+          const createBtn = btns.find(b => (b.innerText || "").includes("Create project"));
+          if (createBtn) {
+            createBtn.click();
+            return true;
+          }
+        }
+        return false;
+      }
+    });
+    if (createdRes?.[0]?.result) {
+      projectCreated = true;
+      break;
+    }
+    await sleep(2000);
+  }
+  
+  if (!projectCreated) {
+    throw new Error("Could not submit the 'Create project' modal.");
+  }
+  
+  // 4. Wait for redirection and capture URL
+  let projectUrl = null;
+  const redirectStarted = Date.now();
+  while (Date.now() - redirectStarted < 20000) {
+    const currentTab = await chrome.tabs.get(tab.id);
+    const url = currentTab.url || "";
+    if (url.includes("gpt-image-cli")) {
+      projectUrl = url;
+      break;
+    }
+    
+    // Fallback: check sidebar links for new project
+    const linksRes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: () => {
+        const links = Array.from(document.querySelectorAll("a"));
+        const link = links.find(l => (l.getAttribute("href") || "").includes("gpt-image-cli"));
+        if (link) {
+          const href = link.getAttribute("href");
+          if (href.startsWith("/")) return "https://chatgpt.com" + href;
+          return href;
+        }
+        return null;
+      }
+    });
+    
+    if (linksRes?.[0]?.result) {
+      projectUrl = linksRes[0].result;
+      break;
+    }
+    await sleep(2000);
+  }
+  
+  if (!projectUrl) {
+    throw new Error("Timed out waiting for new project redirection to resolve.");
+  }
+  
+  return { projectUrl };
 }

@@ -4,6 +4,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
+import registerImageTools from "./image_tools";
+
 
 /**
  * Existing-profile Chrome bridge for pi.
@@ -461,6 +463,9 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tap",
 	"chrome_scroll",
 	"chrome_upload_file",
+	"chrome_generate_image",
+	"chrome_edit_image",
+	"chrome_init_project",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
 
@@ -926,6 +931,8 @@ Usage rules:
 	function registerChromeTools(pi: ExtensionAPI): void {
 		if (chromeToolsRegistered) return;
 		chromeToolsRegistered = true;
+
+		registerImageTools(pi, authorizedBridgeSend, workspaceCwd);
 
 	pi.registerTool({
 		name: "chrome_launch",
