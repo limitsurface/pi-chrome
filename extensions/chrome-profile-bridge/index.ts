@@ -4,6 +4,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import registerImageTools from "./image_tools";
 
 
@@ -61,6 +62,25 @@ const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_ELEMENTS = 80;
+const CONFIG_DIR = resolve(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-chrome");
+const CONFIG_FILE = resolve(CONFIG_DIR, "settings.json");
+
+type PiChromeSettings = {
+	autoconnect?: boolean;
+};
+
+function readSettings(): PiChromeSettings {
+	try {
+		return JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as PiChromeSettings;
+	} catch {
+		return {};
+	}
+}
+
+async function writeSettings(settings: PiChromeSettings): Promise<void> {
+	await mkdir(CONFIG_DIR, { recursive: true });
+	await writeFile(CONFIG_FILE, JSON.stringify(settings, null, 2) + "\n", "utf8");
+}
 
 function truncateText(text: string, maxChars = MAX_TEXT_CHARS): string {
 	if (text.length <= maxChars) return text;
@@ -491,6 +511,7 @@ export default function (pi: ExtensionAPI): void {
 	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
+	let settings = readSettings();
 	let backgroundDefault = false;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	let chromeToolsRegistered = false;
@@ -584,7 +605,13 @@ export default function (pi: ExtensionAPI): void {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		settings = readSettings();
 		await bridge.start();
+		if (settings.autoconnect) {
+			chromeAuthorizedUntil = "indefinite";
+			activateChromeTools();
+			ctx.ui.notify("pi-chrome autoconnect is enabled; Chrome control authorized indefinitely.", "info");
+		}
 		updateChromeStatus(ctx);
 	});
 
@@ -714,6 +741,30 @@ Usage rules:
 		ctx.ui.notify(`Run in background → ${nextLabel}. ${BACKGROUND_DESC[nextLabel]}`, "info");
 	};
 
+	const autoconnectHandler = async (ctx: ExtensionContext, args: string) => {
+		const arg = (args || "").trim().toLowerCase();
+		if (arg === "status" || arg === "") {
+			ctx.ui.notify(`Autoconnect is ${settings.autoconnect ? "on" : "off"}. Settings file: ${CONFIG_FILE}`, "info");
+			return;
+		}
+		if (arg === "on" || arg === "true" || arg === "1") settings = { ...settings, autoconnect: true };
+		else if (arg === "off" || arg === "false" || arg === "0") settings = { ...settings, autoconnect: false };
+		else if (arg === "toggle") settings = { ...settings, autoconnect: !settings.autoconnect };
+		else {
+			ctx.ui.notify(`Unknown autoconnect setting '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
+			return;
+		}
+		await writeSettings(settings);
+		if (settings.autoconnect) {
+			chromeAuthorizedUntil = "indefinite";
+			activateChromeTools();
+			ctx.ui.notify(`Autoconnect → on. Future Pi starts will authorize Chrome control indefinitely without prompting.`, "info");
+		} else {
+			ctx.ui.notify(`Autoconnect → off. Future Pi starts will keep Chrome control locked until /chrome authorize.`, "info");
+		}
+		updateChromeStatus(ctx);
+	};
+
 	const authorizeFor = async (ctx: ExtensionContext, label: string, until: number | "indefinite") => {
 		const ok = await ctx.ui.confirm(
 			"Authorize pi-chrome control?",
@@ -790,6 +841,7 @@ Usage rules:
 		}
 		parts.push(`auth: ${authSummary()}`);
 		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
+		parts.push(`autoconnect: ${settings.autoconnect ? "on" : "off"}`);
 		return parts.join(" · ");
 	};
 
@@ -840,6 +892,7 @@ Usage rules:
 				"Lock Chrome control",
 				"Doctor / troubleshoot",
 				"Background / watch mode…",
+				"Autoconnect on startup…",
 				"Install / onboard extension",
 			]);
 			if (!choice) return;
@@ -848,6 +901,7 @@ Usage rules:
 				case "Lock Chrome control": return revokeHandler(ctx);
 				case "Doctor / troubleshoot": return doctorHandler(ctx);
 				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
+				case "Autoconnect on startup…": return autoconnectHandler(ctx, settings.autoconnect ? "off" : "on");
 				case "Install / onboard extension": return onboardHandler(ctx);
 			}
 		}
@@ -855,7 +909,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\n  /chrome autoconnect [on|off|status|toggle] — on Pi start, authorize Chrome indefinitely without prompting.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -878,6 +932,7 @@ Usage rules:
 					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
 					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
+					{ fullValue: "autoconnect", label: "autoconnect", description: "Authorize Chrome indefinitely without prompting when Pi starts." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -891,6 +946,13 @@ Usage rules:
 					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch (default)." },
 					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
 					{ fullValue: "background status", label: "status", description: "Show the current setting." },
+				];
+			} else if (path[0] === "autoconnect" && path.length === 1) {
+				candidates = [
+					{ fullValue: "autoconnect on", label: "on", description: "On Pi start, authorize Chrome control indefinitely without prompting." },
+					{ fullValue: "autoconnect off", label: "off", description: "Keep Chrome control locked on Pi start." },
+					{ fullValue: "autoconnect toggle", label: "toggle", description: "Flip whichever way it's currently set." },
+					{ fullValue: "autoconnect status", label: "status", description: "Show the current setting." },
 				];
 			}
 			if (candidates.length === 0) return null;
@@ -914,15 +976,18 @@ Usage rules:
 				case "onboard": return onboardHandler(ctx);
 				case "background":
 					return backgroundHandler(ctx, subArgs);
+				case "autoconnect":
+					return autoconnectHandler(ctx, subArgs);
 				case "settings": {
 					// Legacy nested form: /chrome settings background ...
 					const [setting, ...settingArgs] = rest;
 					if (setting === "background") return backgroundHandler(ctx, settingArgs.join(" "));
-					ctx.ui.notify(`'/chrome settings' was removed. Use /chrome background directly.`, "warning");
+					if (setting === "autoconnect") return autoconnectHandler(ctx, settingArgs.join(" "));
+					ctx.ui.notify(`'/chrome settings' was removed. Use /chrome background or /chrome autoconnect directly.`, "warning");
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | background.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | background | autoconnect.`, "warning");
 			}
 		},
 	});

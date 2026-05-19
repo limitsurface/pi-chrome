@@ -35,8 +35,8 @@ export default function registerImageTools(
 	pi.registerTool({
 		name: "chrome_generate_image",
 		label: "Chrome Generate Image",
-		description: "Generate a new image, perform reference-guided generation, or edit a canvas in DALL-E 3 inside ChatGPT using the Chrome companion extension. Saves the image to disk.",
-		promptSnippet: "Generate a DALL-E 3 image via Chrome and save it locally.",
+		description: "Generate a new image, perform reference-guided generation, or edit a canvas with gpt-image-2 inside ChatGPT using the Chrome companion extension. Saves the image to disk.",
+		promptSnippet: "Generate a gpt-image-2 image via Chrome and save it locally.",
 		parameters: Type.Object({
 			prompt: Type.String({ description: "Detailed description of the image to generate, or instructions on how to edit the reference images." }),
 			outputPath: Type.String({ description: "Local path where the generated image should be saved." }),
@@ -66,7 +66,7 @@ export default function registerImageTools(
 			const cwd = workspaceCwd(ctx);
 			const absoluteOutputPath = resolve(cwd, params.outputPath);
 			const referencePaths = params.referencePaths || [];
-			const absoluteReferencePaths = referencePaths.map((r: string) => resolve(cwd, r));
+			const absoluteReferencePaths = Array.from(new Set(referencePaths.map((r: string) => resolve(cwd, r))));
 
 			// Resolve project URL from params or fall back to local agent config file
 			let projectUrl = params.projectUrl;
@@ -98,7 +98,7 @@ export default function registerImageTools(
 			await writeFile(absoluteOutputPath, Buffer.from(base64, "base64"));
 
 			return {
-				content: [{ type: "text", text: `Successfully generated DALL-E image and saved to: ${params.outputPath}` }],
+				content: [{ type: "text", text: `Successfully generated gpt-image-2 image and saved to: ${params.outputPath}` }],
 				details: { outputPath: params.outputPath },
 			};
 		},
@@ -110,7 +110,7 @@ export default function registerImageTools(
 		description: "Dynamically create, name, and bind a new ChatGPT project in Chrome. Returns the project URL and persists it to local agent config.",
 		promptSnippet: "Create and bind a new ChatGPT project workspace in Chrome.",
 		parameters: Type.Object({
-			projectName: Type.Optional(Type.String({ description: "Optional name for the new ChatGPT project. Default is 'gpt-image-cli'." })),
+			projectName: Type.String({ description: "Name for the new ChatGPT project." }),
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, run silently in the background. Default false." }),
 			),
@@ -125,7 +125,10 @@ export default function registerImageTools(
 			_onUpdate: (update: unknown) => void,
 			_ctx: ExtensionContext,
 		): Promise<ToolTextResult> {
-			const projectName = params.projectName || "gpt-image-cli";
+			const projectName = params.projectName?.trim();
+			if (!projectName) {
+				throw new Error("chrome_init_project requires projectName; refusing to fall back to gpt-image-cli.");
+			}
 
 			// Send to the companion Chrome extension bridge with a 60s timeout
 			const result = (await authorizedBridgeSend(

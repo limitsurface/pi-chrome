@@ -460,9 +460,20 @@ async function chromeInputFill(params) {
   await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
   await sleep(rng(20, 60));
   const text = String(params.text || "");
-  for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
+  if (text) {
+    // Fast paste-style fill: CDP's Input.insertText targets the focused editable
+    // and lets the page receive normal beforeinput/input plumbing in one shot.
+    // This is much more reliable for React/contenteditable prompt boxes than
+    // assigning .value directly, and much faster than character-by-character
+    // key dispatch. Fall back to typed characters if the browser rejects it.
+    try {
+      await cdp(tab.id, "Input.insertText", { text });
+    } catch {
+      for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
+    }
+  }
   if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
-  return { input: "chrome", length: text.length };
+  return { input: "chrome", length: text.length, mode: "insertText" };
 }
 
 async function chromeInputScroll(params) {
@@ -563,23 +574,52 @@ async function chromeInputUpload(params) {
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
   if (!paths.length) throw new Error("chrome.upload: no file paths provided");
+  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
   const expression = `(() => {
     const selector = ${JSON.stringify(params.selector ?? null)};
     const uid = ${JSON.stringify(params.uid ?? null)};
     const state = window.__PI_CHROME_STATE__;
-    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    let el = uid && state && state.elements ? state.elements[uid] : null;
+    if (!el && selector) {
+      const matches = Array.from(document.querySelectorAll(selector));
+      const fileInputs = matches.filter((candidate) => candidate && candidate.tagName === "INPUT" && candidate.type === "file");
+      if (fileInputs.length) {
+        const scored = fileInputs.map((candidate, index) => {
+          const rect = candidate.getBoundingClientRect();
+          const style = getComputedStyle(candidate);
+          const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+          const accept = (candidate.getAttribute("accept") || "").toLowerCase();
+          const aria = (candidate.getAttribute("aria-label") || "").toLowerCase();
+          const name = (candidate.getAttribute("name") || "").toLowerCase();
+          const imageish = /image|png|jpeg|jpg|webp|gif/.test(accept + " " + aria + " " + name);
+          const enabled = !candidate.disabled && candidate.getAttribute("aria-disabled") !== "true";
+          return { candidate, index, score: (enabled ? 100 : 0) + (imageish ? 20 : 0) + (visible ? 5 : 0) + index };
+        });
+        scored.sort((a, b) => b.score - a.score);
+        el = scored[0].candidate;
+      } else {
+        el = document.querySelector(selector);
+      }
+    }
     if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    document.querySelectorAll('[data-pi-chrome-upload-target="true"]').forEach((candidate) => candidate.removeAttribute("data-pi-chrome-upload-target"));
+    el.setAttribute("data-pi-chrome-upload-target", "true");
     return el;
   })()`;
   const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
   if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
   const objectId = evaluated.result?.objectId;
   if (!objectId) throw new Error("Could not resolve file input object");
-  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-  const requested = await cdp(tab.id, "DOM.requestNode", { objectId });
-  if (!requested.nodeId) throw new Error("Could not resolve file input node");
-  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId: requested.nodeId, files: paths });
+  let requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => ({}));
+  let nodeId = requested.nodeId;
+  if (!nodeId) {
+    const root = await cdp(tab.id, "DOM.getDocument", { depth: -1, pierce: true });
+    const found = await cdp(tab.id, "DOM.querySelector", { nodeId: root.root.nodeId, selector: '[data-pi-chrome-upload-target="true"]' });
+    nodeId = found.nodeId;
+  }
+  if (!nodeId) throw new Error("Could not resolve file input node");
+  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId, files: paths });
   await cdp(tab.id, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
@@ -2287,7 +2327,7 @@ async function setChatGPTModelMode(tabId, thinking) {
 async function chromeImageGenerate(params) {
   const prompt = params.prompt;
   const aspectRatio = params.aspectRatio;
-  const referencePaths = params.referencePaths || [];
+  const referencePaths = Array.from(new Set((params.referencePaths || []).map(String)));
   const foreground = params.foreground !== false;
   
   let fullPrompt = prompt;
@@ -2327,30 +2367,14 @@ async function chromeImageGenerate(params) {
     await sleep(4000);
   }
 
-  // 6. Enter prompt using direct React-compatible paste
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id, frameIds: [0] },
-    world: "MAIN",
-    func: (promptText) => {
-      const el = document.querySelector("#prompt-textarea");
-      if (!el) throw new Error("Could not find prompt text area");
-      el.focus();
-      
-      const prototype = HTMLTextAreaElement.prototype;
-      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
-      if (descriptor && descriptor.set) {
-        descriptor.set.call(el, promptText);
-      } else {
-        el.value = promptText;
-      }
-      
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "a", code: "KeyA" }));
-      el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: "a", code: "KeyA" }));
-      return true;
-    },
-    args: [fullPrompt]
+  // 6. Enter prompt using the shared paste-style fill path. This uses CDP
+  // Input.insertText against the focused prompt box, avoiding fragile direct
+  // DOM value assignment on ChatGPT's React/contenteditable composer.
+  await chromeInputFill({
+    targetId: tab.id,
+    selector: "#prompt-textarea",
+    text: fullPrompt,
+    foreground,
   });
 
   await sleep(1000);
@@ -2399,7 +2423,7 @@ async function chromeImageGenerate(params) {
   }
 
   if (!imageUrl) {
-    throw new Error("Timed out waiting for DALL-E image generation to complete.");
+    throw new Error("Timed out waiting for gpt-image-2 image generation to complete.");
   }
 
   // 8. Download the image
@@ -2409,7 +2433,11 @@ async function chromeImageGenerate(params) {
 
 async function chromeImageInit(params) {
   const foreground = params.foreground !== false;
-  const projectName = params.projectName || "gpt-image-cli";
+  const projectName = String(params.projectName ?? "").trim();
+  if (!projectName) {
+    throw new Error("page.init_project requires params.projectName; refusing to fall back to the old gpt-image-cli default.");
+  }
+  const projectSlug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   
   // 1. Locate/activate ChatGPT tab
   const tab = await findOrCreateChatGPTTab(foreground);
@@ -2450,40 +2478,87 @@ async function chromeImageInit(params) {
   
   await sleep(2000);
   
-  // 3. Set project name in the name input field and click 'Create project'
+  // 3. Set project name in the modal using real Chrome input, then click 'Create project'.
+  // ChatGPT is React-controlled; assigning input.value directly can leave app state stale or
+  // accidentally target the wrong page-level text box. Mark the visible modal input, fill it
+  // through CDP, verify the value, then click the modal's create button.
   let projectCreated = false;
   const createdStarted = Date.now();
-  while (Date.now() - createdStarted < 15000) {
-    const createdRes = await chrome.scripting.executeScript({
+  while (Date.now() - createdStarted < 20000) {
+    const inputRes = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
       world: "MAIN",
-      func: (name) => {
-        const input = document.querySelector('input[type="text"]');
-        if (input) {
-          input.value = name;
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-          
-          // Now click the create button
-          const btns = Array.from(document.querySelectorAll("button"));
-          const createBtn = btns.find(b => (b.innerText || "").includes("Create project"));
-          if (createBtn) {
-            createBtn.click();
-            return true;
-          }
-        }
-        return false;
+      func: () => {
+        const isVisible = (el) => {
+          const r = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+        document.querySelectorAll('[data-pi-chrome-project-name-input="true"]').forEach((el) => el.removeAttribute("data-pi-chrome-project-name-input"));
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')).filter(isVisible);
+        const scope = dialogs[dialogs.length - 1] || document;
+        const inputs = Array.from(scope.querySelectorAll('input:not([type]), input[type="text"], textarea')).filter((el) => !el.disabled && !el.readOnly && isVisible(el));
+        const preferred = inputs.find((el) => {
+          const haystack = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("placeholder") || ""} ${el.getAttribute("name") || ""}`.toLowerCase();
+          return /project|name|title/.test(haystack);
+        }) || inputs[inputs.length - 1];
+        if (!preferred) return { ok: false, reason: "no visible project-name input", inputCount: inputs.length };
+        preferred.setAttribute("data-pi-chrome-project-name-input", "true");
+        return { ok: true, tag: preferred.tagName, placeholder: preferred.getAttribute("placeholder"), ariaLabel: preferred.getAttribute("aria-label") };
+      }
+    });
+    const inputInfo = inputRes?.[0]?.result;
+    if (!inputInfo?.ok) {
+      await sleep(1000);
+      continue;
+    }
+
+    await chromeInputFill({
+      targetId: tab.id,
+      selector: '[data-pi-chrome-project-name-input="true"]',
+      text: projectName,
+      foreground,
+    });
+    await sleep(300);
+
+    const createRes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: (expectedName) => {
+        const input = document.querySelector('[data-pi-chrome-project-name-input="true"]');
+        const actualName = input ? input.value : "";
+        if (actualName !== expectedName) return { ok: false, reason: "name did not stick", actualName };
+        const isVisible = (el) => {
+          const r = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')).filter(isVisible);
+        const scope = dialogs[dialogs.length - 1] || document;
+        const btns = Array.from(scope.querySelectorAll("button")).filter(isVisible);
+        const createBtn = btns.find(b => /create project/i.test(b.innerText || b.getAttribute("aria-label") || ""));
+        if (!createBtn) return { ok: false, reason: "no create button" };
+        if (createBtn.disabled || createBtn.getAttribute("aria-disabled") === "true") return { ok: false, reason: "create button disabled", actualName };
+        createBtn.setAttribute("data-pi-chrome-create-project-button", "true");
+        return { ok: true, actualName };
       },
       args: [projectName]
     });
-    if (createdRes?.[0]?.result) {
+    const createInfo = createRes?.[0]?.result;
+    if (createInfo?.ok) {
+      await chromeInputClick({
+        targetId: tab.id,
+        selector: '[data-pi-chrome-create-project-button="true"]',
+        foreground,
+      });
       projectCreated = true;
       break;
     }
-    await sleep(2000);
+    await sleep(1000);
   }
   
   if (!projectCreated) {
-    throw new Error("Could not submit the 'Create project' modal.");
+    throw new Error(`Could not submit the 'Create project' modal for '${projectName}'.`);
   }
   
   // 4. Wait for redirection and capture URL
@@ -2492,7 +2567,7 @@ async function chromeImageInit(params) {
   while (Date.now() - redirectStarted < 20000) {
     const currentTab = await chrome.tabs.get(tab.id);
     const url = currentTab.url || "";
-    if (url.includes(projectName)) {
+    if ((projectSlug && url.toLowerCase().includes(projectSlug)) || url.includes(projectName)) {
       projectUrl = url;
       break;
     }
@@ -2501,9 +2576,13 @@ async function chromeImageInit(params) {
     const linksRes = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
       world: "MAIN",
-      func: (name) => {
+      func: (name, slug) => {
         const links = Array.from(document.querySelectorAll("a"));
-        const link = links.find(l => (l.getAttribute("href") || "").includes(name));
+        const link = links.find(l => {
+          const href = l.getAttribute("href") || "";
+          const text = (l.innerText || l.getAttribute("aria-label") || "").trim();
+          return href.includes(name) || (slug && href.toLowerCase().includes(slug)) || text === name;
+        });
         if (link) {
           const href = link.getAttribute("href");
           if (href.startsWith("/")) return "https://chatgpt.com" + href;
@@ -2511,7 +2590,7 @@ async function chromeImageInit(params) {
         }
         return null;
       },
-      args: [projectName]
+      args: [projectName, projectSlug]
     });
     
     if (linksRes?.[0]?.result) {
