@@ -15,7 +15,7 @@ type ToolTextResult = {
 async function getProjectUrl(): Promise<string> {
 	try {
 		const content = await readFile(CONFIG_FILE, "utf-8");
-		const json = JSON.parse(content);
+		const json = JSON.parse(content) as { projectUrl?: string };
 		return json.projectUrl || "";
 	} catch {
 		return "";
@@ -48,11 +48,25 @@ export default function registerImageTools(
 				Type.Boolean({ description: "If true, run silently in the background. Default false (user can watch Chrome work)." }),
 			),
 		}),
-		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
+		async execute(
+			_id: string,
+			params: {
+				prompt: string;
+				outputPath: string;
+				aspectRatio?: string;
+				referencePaths?: string[];
+				projectUrl?: string;
+				thinking?: boolean;
+				background?: boolean;
+			},
+			signal: AbortSignal,
+			_onUpdate: (update: unknown) => void,
+			ctx: ExtensionContext,
+		): Promise<ToolTextResult> {
 			const cwd = workspaceCwd(ctx);
 			const absoluteOutputPath = resolve(cwd, params.outputPath);
 			const referencePaths = params.referencePaths || [];
-			const absoluteReferencePaths = referencePaths.map(r => resolve(cwd, r));
+			const absoluteReferencePaths = referencePaths.map((r: string) => resolve(cwd, r));
 
 			// Resolve project URL from params or fall back to local agent config file
 			let projectUrl = params.projectUrl;
@@ -101,7 +115,16 @@ export default function registerImageTools(
 				Type.Boolean({ description: "If true, run silently in the background. Default false." }),
 			),
 		}),
-		async execute(_id, params, signal, _onUpdate, _ctx: ExtensionContext): Promise<ToolTextResult> {
+		async execute(
+			_id: string,
+			params: {
+				projectName?: string;
+				background?: boolean;
+			},
+			signal: AbortSignal,
+			_onUpdate: (update: unknown) => void,
+			_ctx: ExtensionContext,
+		): Promise<ToolTextResult> {
 			const projectName = params.projectName || "gpt-image-cli";
 
 			// Send to the companion Chrome extension bridge with a 60s timeout
