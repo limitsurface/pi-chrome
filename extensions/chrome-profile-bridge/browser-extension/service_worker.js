@@ -2345,10 +2345,8 @@ async function chromeImageGenerate(params) {
   await waitForTabComplete(tab.id, 20000);
   await sleep(3000);
 
-  // 3. Switch ChatGPT model mode if requested
-  if (params.thinking !== undefined) {
-    await setChatGPTModelMode(tab.id, params.thinking);
-  }
+  // 3. Switch ChatGPT model mode (default to false / Instant if not specified)
+  await setChatGPTModelMode(tab.id, !!params.thinking);
 
   const uploadedFilenames = referencePaths.map(p => p.split(/[/\\]/).pop());
 
@@ -2407,8 +2405,8 @@ async function chromeImageGenerate(params) {
     }
   });
 
-  // 7. Poll for the new image (wait up to 120 seconds if references are used, otherwise 90s)
-  const maxWait = referencePaths.length > 0 ? 120000 : 90000;
+  // 7. Poll for the new image (wait up to 240 seconds if references are used, otherwise 180s)
+  const maxWait = referencePaths.length > 0 ? 240000 : 180000;
   const started = Date.now();
   let imageUrl = null;
   while (Date.now() - started < maxWait) {

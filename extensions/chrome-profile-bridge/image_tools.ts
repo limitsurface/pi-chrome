@@ -74,7 +74,7 @@ export default function registerImageTools(
 				projectUrl = await getProjectUrl();
 			}
 
-			// Send to the companion Chrome extension bridge with a 150s timeout
+			// Send to the companion Chrome extension bridge with a 300s timeout
 			const result = (await authorizedBridgeSend(
 				"page.generate_image",
 				{
@@ -85,7 +85,7 @@ export default function registerImageTools(
 					thinking: params.thinking,
 					foreground: !params.background,
 				},
-				150_000,
+				300_000,
 				signal,
 			)) as { dataUrl?: string; error?: string };
 
